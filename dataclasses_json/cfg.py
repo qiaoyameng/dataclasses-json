@@ -4,6 +4,7 @@ from typing import Callable, Dict, Optional, TypeVar, Union
 
 from marshmallow.fields import Field as MarshmallowField  # type: ignore
 
+from dataclasses_json._datetime import DatetimeFormat, coerce_datetime_format
 from dataclasses_json.stringcase import (camelcase, pascalcase, snakecase,
                                          spinalcase)  # type: ignore
 from dataclasses_json.undefined import Undefined, UndefinedParameterError
@@ -64,6 +65,7 @@ def config(metadata: Optional[dict] = None, *,
            undefined: Optional[Union[str, Undefined]] = None,
            field_name: Optional[str] = None,
            exclude: Optional[Callable[[T], bool]] = None,
+           datetime_format: Union[DatetimeFormat, str, None] = None,
            ) -> Dict[str, dict]:
     if metadata is None:
         metadata = {}
@@ -106,5 +108,10 @@ def config(metadata: Optional[dict] = None, *,
 
     if exclude is not None:
         lib_metadata['exclude'] = exclude
+
+    if datetime_format is not None:
+        lib_metadata['datetime_format'] = coerce_datetime_format(
+            datetime_format
+        )
 
     return metadata

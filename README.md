@@ -75,6 +75,65 @@ datetime-aware object. This is important, because encoding and decoding won't
 strictly be inverses. See [this section](#Overriding) if you want to override this default
 behavior (for example, if you want to use ISO).
 
+##### Explicit ISO 8601 datetimes
+
+Timestamp values are interpreted using the host timezone, so they are not a
+portable wire format across deployments. Use `DatetimeFormat.ISO` to exchange
+explicit ISO 8601 strings without borrowing the machine's local timezone:
+
+```python
+from dataclasses import dataclass
+from datetime import datetime
+from dataclasses_json import DatetimeFormat, dataclass_json
+
+
+@dataclass_json(datetime_format=DatetimeFormat.ISO)
+@dataclass
+class Event:
+    occurred_at: datetime
+```
+
+The same option can be applied to one field through `config(...)`:
+
+```python
+from dataclasses import dataclass, field
+from datetime import datetime
+from dataclasses_json import DatetimeFormat, config, dataclass_json
+
+
+@dataclass_json
+@dataclass
+class Event:
+    occurred_at: datetime = field(
+        metadata=config(datetime_format=DatetimeFormat.ISO)
+    )
+```
+
+The built-in ISO codec applies to scalar datetimes and datetime values inside
+lists, tuples, sets, mappings, and optional fields. Both direct
+`from_dict`/`to_dict` and generated `schema().load`/`schema().dump` use the
+same rules:
+
+- Timezone designators are required: use `Z` for UTC or a numeric offset such
+  as `+02:00` or `-05:00`.
+- Naive input is rejected; the host timezone is never substituted.
+- `Z` and any fixed zero offset decode to the same UTC instant. Non-zero
+  offsets are preserved on output.
+- Fractional seconds use at most six digits (microsecond precision). Fewer
+  digits are accepted; six digits are retained.
+- Leap seconds, dates outside `0001-01-01` through `9999-12-31`, and other
+  values that `datetime` cannot represent are errors. Direct decoding raises
+  `IsoDatetimeError`; schema decoding reports the error on the corresponding
+  field or nested container path.
+- Encoding a naive datetime is rejected so a value cannot silently acquire a
+  machine-local UTC offset.
+
+The default remains `DatetimeFormat.TIMESTAMP` for backwards compatibility.
+A field can explicitly select `TIMESTAMP` even when its class selects `ISO`.
+Field configuration overrides class configuration. An explicit `encoder`,
+`decoder`, or `mm_field` at a more specific scope takes precedence over the
+built-in datetime format at that scope.
+
 - [UUID](https://docs.python.org/3/library/uuid.html#uuid.UUID) objects. They 
 are encoded as `str` (JSON string).
 
@@ -522,6 +581,11 @@ person_schema.dump(person)
 
 For example, you might want to encode/decode `datetime` objects using ISO format
 rather than the default `timestamp`.
+
+For the built-in strict ISO 8601 codec, prefer
+`datetime_format=DatetimeFormat.ISO` on the decorator or field (see the
+[Supported types](#supported-types) section). The example below remains useful
+when you need a custom codec or a different Marshmallow field.
 
 ```python
 from dataclasses import dataclass, field

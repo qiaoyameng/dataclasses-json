@@ -3,6 +3,7 @@ import json
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar, Union, overload
 
 from dataclasses_json.cfg import config, LetterCase
+from dataclasses_json._datetime import DatetimeFormat
 from dataclasses_json.core import (Json, _ExtendedEncoder, _asdict,
                                    _decode_dataclass)
 from dataclasses_json.mm import (JsonData, SchemaType, build_schema)
@@ -104,16 +105,22 @@ class DataClassJsonMixin(abc.ABC):
 
 @overload
 def dataclass_json(_cls: None = ..., *, letter_case: Optional[LetterCase] = ...,
-                   undefined: Optional[Union[str, Undefined]] = ...) -> Callable[[Type[T]], Type[T]]: ...
+                   undefined: Optional[Union[str, Undefined]] = ...,
+                   datetime_format: Optional[Union[DatetimeFormat, str]] = ...
+                   ) -> Callable[[Type[T]], Type[T]]: ...
 
 
 @overload
 def dataclass_json(_cls: Type[T], *, letter_case: Optional[LetterCase] = ...,
-                   undefined: Optional[Union[str, Undefined]] = ...) -> Type[T]: ...
+                   undefined: Optional[Union[str, Undefined]] = ...,
+                   datetime_format: Optional[Union[DatetimeFormat, str]] = ...
+                   ) -> Type[T]: ...
 
 
 def dataclass_json(_cls: Optional[Type[T]] = None, *, letter_case: Optional[LetterCase] = None,
-                   undefined: Optional[Union[str, Undefined]] = None) -> Union[Callable[[Type[T]], Type[T]], Type[T]]:
+                   undefined: Optional[Union[str, Undefined]] = None,
+                   datetime_format: Optional[Union[DatetimeFormat, str]] = None
+                   ) -> Union[Callable[[Type[T]], Type[T]], Type[T]]:
     """
     Based on the code in the `dataclasses` module to handle optional-parens
     decorators. See example below:
@@ -125,7 +132,7 @@ def dataclass_json(_cls: Optional[Type[T]] = None, *, letter_case: Optional[Lett
     """
 
     def wrap(cls: Type[T]) -> Type[T]:
-        return _process_class(cls, letter_case, undefined)
+        return _process_class(cls, letter_case, undefined, datetime_format)
 
     if _cls is None:
         return wrap
@@ -133,10 +140,15 @@ def dataclass_json(_cls: Optional[Type[T]] = None, *, letter_case: Optional[Lett
 
 
 def _process_class(cls: Type[T], letter_case: Optional[LetterCase],
-                   undefined: Optional[Union[str, Undefined]]) -> Type[T]:
-    if letter_case is not None or undefined is not None:
-        cls.dataclass_json_config = config(letter_case=letter_case,  # type: ignore[attr-defined]
-                                           undefined=undefined)['dataclasses_json']
+                   undefined: Optional[Union[str, Undefined]],
+                   datetime_format: Optional[Union[DatetimeFormat, str]] = None
+                   ) -> Type[T]:
+    if letter_case is not None or undefined is not None or datetime_format is not None:
+        cls.dataclass_json_config = config(  # type: ignore[attr-defined]
+            letter_case=letter_case,
+            undefined=undefined,
+            datetime_format=datetime_format
+        )['dataclasses_json']
 
     cls.to_json = DataClassJsonMixin.to_json  # type: ignore[attr-defined]
     # unwrap and rewrap classmethod to tag it to cls rather than the literal

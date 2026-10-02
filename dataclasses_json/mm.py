@@ -18,6 +18,8 @@ from marshmallow.exceptions import ValidationError  # type: ignore
 
 from dataclasses_json.core import (_is_supported_generic, _decode_dataclass,
                                    _ExtendedEncoder, _user_overrides_or_exts)
+from dataclasses_json._datetime import (DatetimeFormat, decode_iso_datetime,
+                                        encode_iso_datetime)
 from dataclasses_json.utils import (_is_collection, _is_optional,
                                     _issubclass_safe, _timestamp_to_dt_aware,
                                     _is_new_type, _get_type_origin,
@@ -63,6 +65,30 @@ class _IsoField(fields.Field):
                 return None
             else:
                 raise ValidationError(self.default_error_messages["required"])
+
+
+class _StrictIsoField(_IsoField):
+    def _serialize(self, value, attr, obj, **kwargs):
+        if value is not None:
+            try:
+                return encode_iso_datetime(value)
+            except (TypeError, ValueError) as exc:
+                raise ValidationError(str(exc)) from exc
+
+        if not self.required:
+            return None
+        raise ValidationError(self.default_error_messages["required"])
+
+    def _deserialize(self, value, attr, data, **kwargs):
+        if value is not None:
+            try:
+                return decode_iso_datetime(value)
+            except (TypeError, ValueError) as exc:
+                raise ValidationError(str(exc)) from exc
+
+        if not self.required:
+            return None
+        raise ValidationError(self.default_error_messages["required"])
 
 
 class _UnionField(fields.Field):
@@ -236,6 +262,9 @@ else:
 
 
 def build_type(type_, options, mixin, field, cls):
+    field_overrides = _user_overrides_or_exts(cls)
+    datetime_format = field_overrides[field.name].datetime_format
+
     def inner(type_, options):
         while True:
             if not _is_new_type(type_):
@@ -273,6 +302,11 @@ def build_type(type_, options, mixin, field, cls):
                 return _TupleVarLen(args[0], **options)
             else:
                 return fields.Tuple(args, **options)
+        if origin is datetime:
+            field_type = (_StrictIsoField
+                          if datetime_format is DatetimeFormat.ISO
+                          else _TimestampField)
+            return field_type(*args, **options)
         if origin in TYPES:
             return TYPES[origin](*args, **options)
 
@@ -327,7 +361,17 @@ def schema(cls, mixin, infer_missing):
                 options['data_key'] = metadata.letter_case(field.name)
 
             t = build_type(type_, options, mixin, field, cls)
-            if field.metadata.get('dataclasses_json', {}).get('decoder'):
+            if metadata.mm_field is None and metadata.encoder is not None:
+                def serialize_with_encoder(value, attr, obj,
+                                           _encoder=metadata.encoder,
+                                           **kwargs):
+                    if value is None:
+                        return None
+                    return _encoder(value)
+
+                t._serialize = serialize_with_encoder
+
+            if metadata.mm_field is None and metadata.decoder is not None:
                 # If the field defines a custom decoder, it should completely replace the Marshmallow field's conversion
                 # logic.
                 # From Marshmallow's documentation for the _deserialize method:
@@ -360,7 +404,7 @@ def build_schema(cls: typing.Type[A],
 
     @post_load
     def make_instance(self, kvs, **kwargs):
-        return _decode_dataclass(cls, kvs, partial)
+        return _decode_dataclass(cls, kvs, partial, _in_schema=True)
 
     def dumps(self, *args, **kwargs):
         if 'cls' not in kwargs:
