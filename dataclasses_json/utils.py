@@ -135,7 +135,12 @@ def _is_new_type_subclass_safe(cls, classinfo):
 
 
 def _is_new_type(type_):
-    return inspect.isfunction(type_) and hasattr(type_, "__supertype__")
+    # Since Python 3.10 NewType instances are objects of class
+    # typing.NewType rather than plain functions; both forms expose
+    # ``__supertype__``.
+    return hasattr(type_, "__supertype__") and (
+        inspect.isfunction(type_) or
+        type(type_).__name__ == "NewType")
 
 
 def _is_optional(type_):

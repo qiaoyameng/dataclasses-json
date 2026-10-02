@@ -17,7 +17,10 @@ from marshmallow import fields, Schema, post_load  # type: ignore
 from marshmallow.exceptions import ValidationError  # type: ignore
 
 from dataclasses_json.core import (_is_supported_generic, _decode_dataclass,
-                                   _ExtendedEncoder, _user_overrides_or_exts)
+                                   _ExtendedEncoder, _user_overrides_or_exts,
+                                   _encode_int_compat_tree)
+from dataclasses_json.cfg import (decode_int_compat, encode_int_compat,
+                                  global_config)
 from dataclasses_json.utils import (_is_collection, _is_optional,
                                     _issubclass_safe, _timestamp_to_dt_aware,
                                     _is_new_type, _get_type_origin,
@@ -130,6 +133,31 @@ class _TupleVarLen(fields.List):
         return None if optional_list is None else tuple(optional_list)
 
 
+class _CompatInteger(fields.Int):
+    """
+    Integer field honoring the integer compatibility mode.
+
+    On serialization unsafe integers are emitted as decimal strings; on
+    deserialization plain decimal strings are restored at integer positions,
+    while booleans, fractional numbers and exponent notation are rejected.
+    """
+
+    def _serialize(self, value, attr, obj, **kwargs):
+        if value is not None and global_config.int_compat_enabled:
+            return encode_int_compat(value)
+        return super()._serialize(value, attr, obj, **kwargs)
+
+    def _deserialize(self, value, attr, data, **kwargs):
+        if global_config.int_compat_enabled:
+            if value is None:
+                return None
+            try:
+                return decode_int_compat(value)
+            except (TypeError, ValueError) as exc:
+                raise ValidationError(str(exc)) from exc
+        return super()._deserialize(value, attr, data, **kwargs)
+
+
 TYPES = {
     typing.Mapping: fields.Mapping,
     typing.MutableMapping: fields.Mapping,
@@ -142,7 +170,7 @@ TYPES = {
     list: fields.List,
     tuple: fields.Tuple,
     str: fields.Str,
-    int: fields.Int,
+    int: _CompatInteger,
     float: fields.Float,
     bool: fields.Bool,
     datetime: _TimestampField,
@@ -243,6 +271,17 @@ def build_type(type_, options, mixin, field, cls):
 
             type_ = type_.__supertype__
 
+        # Optional[X] / Union[X, None] with a single concrete type is just X
+        # that allows None. Build the concrete field directly (otherwise a
+        # plain scalar such as int would be wrapped in _UnionField, bypassing
+        # its field conversion, e.g. the integer compatibility mode).
+        if _is_optional(type_) and not type_ is typing.Any:
+            args_wo_none = [a for a in getattr(type_, '__args__', [])
+                            if a is not type(None)]
+            if len(args_wo_none) == 1:
+                options["allow_none"] = True
+                return inner(args_wo_none[0], options)
+
         if is_dataclass(type_):
             if _issubclass_safe(type_, mixin):
                 options['field_many'] = bool(
@@ -319,7 +358,8 @@ def schema(cls, mixin, infer_missing):
             if _is_optional(type_):
                 options.setdefault(missing_key, None)
                 options['allow_none'] = True
-                if len(type_.__args__) == 2:
+                if type_ is not typing.Any and len(
+                        getattr(type_, '__args__', ())) == 2:
                     # Union[str, int, None] is optional too, but it has more than 1 typed field.
                     type_ = [tp for tp in type_.__args__ if tp is not type(None)][0]
 
@@ -384,6 +424,11 @@ def build_schema(cls: typing.Type[A],
         else:
             dumped.update(_handle_undefined_parameters_safe(cls=obj, kvs={},
                                                             usage="dump"))
+        if global_config.int_compat_enabled:
+            # the schema dump has no type information for dynamically typed
+            # positions (Any, catch-all, nested Raw fields); walk the whole
+            # tree so it matches the direct API output
+            dumped = _encode_int_compat_tree(dumped)
         return dumped
 
     schema_ = schema(cls, mixin, infer_missing)

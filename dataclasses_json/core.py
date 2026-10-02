@@ -20,6 +20,7 @@ from uuid import UUID
 from typing_inspect import is_union_type  # type: ignore
 
 from dataclasses_json import cfg
+from dataclasses_json.cfg import decode_int_compat, encode_int_compat
 from dataclasses_json.utils import (_get_type_cons, _get_type_origin,
                                     _handle_undefined_parameters_safe,
                                     _is_collection, _is_mapping, _is_new_type,
@@ -112,6 +113,25 @@ def _encode_json_type(value, default=_ExtendedEncoder().default):
         else:
             return value
     return default(value)
+
+
+def _encode_int_compat_tree(value):
+    """
+    Recursively apply the integer compatibility encoding to a JSON-like
+    value produced outside ``_asdict`` (e.g. a Marshmallow schema dump), so
+    the direct API and the schema API emit identical types and values.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return encode_int_compat(value)
+    if isinstance(value, ABCMapping):
+        return {_encode_int_compat_tree(k): _encode_int_compat_tree(v)
+                for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        converted = [_encode_int_compat_tree(v) for v in value]
+        return tuple(converted) if isinstance(value, tuple) else converted
+    return value
 
 
 def _encode_overrides(kvs, overrides, encode_json=False):
@@ -234,13 +254,16 @@ def _decode_dataclass(cls, kvs, infer_missing):
                                                       field_value,
                                                       infer_missing)
         else:
-            init_kwargs[field.name] = _support_extended_types(field_type,
-                                                              field_value)
+            init_kwargs[field.name] = _decode_type(field_type,
+                                                   field_value,
+                                                   infer_missing)
 
     return cls(**init_kwargs)
 
 
 def _decode_type(type_, value, infer_missing):
+    while _is_new_type(type_):
+        type_ = type_.__supertype__
     if _has_decoder_in_global_config(type_):
         return _get_decoder_in_global_config(type_)(value)
     if _is_supported_generic(type_):
@@ -268,7 +291,20 @@ def _support_extended_types(field_type, field_value):
         res = (field_value
                if isinstance(field_value, UUID)
                else UUID(field_value))
-    elif _issubclass_safe(field_type, (int, float, str, bool)):
+    elif _issubclass_safe(field_type, bool):
+        # bool must be handled before int: isinstance(True, int) is True,
+        # and a bool must never be treated as a (compatibility) integer.
+        res = (field_value
+               if isinstance(field_value, bool)
+               else field_type(field_value))
+    elif _issubclass_safe(field_type, int):
+        if cfg.global_config.int_compat_enabled:
+            res = field_type(decode_int_compat(field_value))
+        else:
+            res = (field_value
+                   if isinstance(field_value, field_type)
+                   else field_type(field_value))
+    elif _issubclass_safe(field_type, (float, str)):
         res = (field_value
                if isinstance(field_value, field_type)
                else field_type(field_value))
@@ -324,25 +360,53 @@ def _decode_generic(type_, value, infer_missing):
         if _args is _NO_ARGS:
             # Any, just accept
             res = value
-        elif _is_optional(type_) and len(_args) == 2:  # Optional
-            type_arg = _get_type_arg_param(type_, 0)
-            res = _decode_type(type_arg, value, infer_missing)
-        else:  # Union (already decoded or try to decode a dataclass)
-            type_options = _get_type_args(type_)
-            res = value  # assume already decoded
-            if type(value) is dict and dict not in type_options:
-                for type_option in type_options:
-                    if is_dataclass(type_option):
-                        try:
-                            res = _decode_dataclass(type_option, value, infer_missing)
-                            break
-                        except (KeyError, ValueError, AttributeError):
-                            continue
-                if res == value:
-                    warnings.warn(
-                        f"Failed to decode {value} Union dataclasses."
-                        f"Expected Union to include a matching dataclass and it didn't."
-                    )
+        elif _is_optional(type_):
+            non_none_args = [a for a in _args if a is not type(None)]
+            if len(non_none_args) == 1:
+                # Optional[X] (also handles Optional nested inside other
+                # generics, e.g. List[Optional[int]]): decode with the
+                # concrete type so scalar conversions such as the integer
+                # compatibility restoration are applied.
+                type_arg = non_none_args[0]
+                res = _decode_type(type_arg, value, infer_missing)
+            else:
+                res = _decode_union(non_none_args, value, infer_missing)
+        elif len(_args) == 1:
+            res = _decode_type(_args[0], value, infer_missing)
+        else:
+            res = _decode_union(_args, value, infer_missing)
+    return res
+
+
+def _decode_union(type_options, value, infer_missing):
+    res = value  # assume already decoded
+    if isinstance(value, dict) and dict not in type_options:
+        for type_option in type_options:
+            if is_dataclass(type_option):
+                try:
+                    res = _decode_dataclass(type_option, value, infer_missing)
+                    break
+                except (KeyError, ValueError, AttributeError):
+                    continue
+        if res == value:
+            warnings.warn(
+                f"Failed to decode {value} Union dataclasses."
+                f"Expected Union to include a matching dataclass and it didn't."
+            )
+    else:
+        # scalar union: try each concrete option in declaration order so
+        # declared scalar positions (e.g. Union[int, str]) restore the
+        # value the same way a non-union field would
+        for type_option in type_options:
+            if not _issubclass_safe(type_option, int) or _issubclass_safe(
+                    type_option, bool):
+                continue
+            try:
+                candidate = _decode_type(type_option, value, infer_missing)
+            except (ValueError, TypeError):
+                continue
+            if type(candidate) is int and type(value) is str:
+                return candidate
     return res
 
 
@@ -445,9 +509,8 @@ def _asdict(obj, encode_json=False):
         return _encode_overrides(dict(result), _user_overrides_or_exts(obj),
                                  encode_json=encode_json)
     elif isinstance(obj, Mapping):
-        return dict((_asdict(k, encode_json=encode_json),
-                     _asdict(v, encode_json=encode_json)) for k, v in
-                    obj.items())
+        return dict((k, _asdict(v, encode_json=encode_json))
+                    for k, v in obj.items())
     # enum.IntFlag and enum.Flag are regarded as collections in Python 3.11, thus a check against Enum is needed
     elif isinstance(obj, Collection) and not isinstance(obj, (str, bytes, Enum)):
         return list(_asdict(v, encode_json=encode_json) for v in obj)
@@ -455,6 +518,11 @@ def _asdict(obj, encode_json=False):
     # applying encoders/decoders from global configuration inconsistent.
     elif _has_encoder_in_global_config(type(obj)):
         return _get_encoder_in_global_config(type(obj))(obj)
+    elif isinstance(obj, int) and not isinstance(obj, bool):
+        # integer compatibility mode: unsafe integers become decimal
+        # strings. A custom encoder above always takes precedence, and
+        # bool values are not converted.
+        return encode_int_compat(obj)
     else:
         return copy.deepcopy(obj)
 

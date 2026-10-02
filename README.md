@@ -289,6 +289,72 @@ Person.from_json('{"overriddenGivenName": "Alice"}')  # Person('Alice')
 Person('Alice').to_json()  # {"overriddenGivenName": "Alice"}
 ```
 
+### Emit large integers (e.g. 64 bit IDs) safely for JavaScript?
+
+JavaScript's `Number` can only represent integers up to
+`Number.MAX_SAFE_INTEGER` (`2**53 - 1`) exactly. A 64 bit ID sent as a JSON
+number therefore loses precision after `JSON.parse` in the browser.
+
+The *integer compatibility mode* emits integers outside a configurable safe
+range as **decimal strings**, and restores those strings back to `int` when
+reading — but only at positions that are explicitly typed as integers
+(including nested containers, `Optional`, tuples, mappings, `NewType` and
+field aliases). Plain `str` and `Any` fields are never converted based on
+their content, and `bool` is never treated as an integer.
+
+```python
+from dataclasses import dataclass
+from typing import List, Optional
+
+from dataclasses_json import dataclass_json, global_config
+
+@dataclass_json
+@dataclass
+class Account:
+    id: int
+    manager_id: Optional[int]
+    related_ids: List[int]
+
+account = Account(9007199254740993, None, [9007199254740994])
+
+with global_config.int_compat_mode():
+    account.to_json()
+    # {"id": "9007199254740993", "manager_id": null,
+    #  "related_ids": ["9007199254740994"]}
+
+    Account.from_json('{"id": "9007199254740993", "manager_id": null, '
+                      '"related_ids": ["9007199254740994"]}')
+    # Account(id=9007199254740993, manager_id=None,
+    #         related_ids=[9007199254740994])
+```
+
+The direct API (`to_json`/`from_json`/`to_dict`) and the schema API
+(`schema().dumps`/`loads`/`dump`/`load`) produce identical JSON and
+identical Python types.
+
+Only plain decimal integer literals are accepted on the way back in.
+Fractional numbers (`1.5`, `"1.5"`), exponent notation (`"1e3"`), padded
+strings (`" 1 "`, `"01"`) and booleans are rejected, as are values outside
+the configured range:
+
+```python
+# default: strings up to the signed 64 bit range (2**63 - 1) are restored
+with global_config.int_compat_mode(safe_range=2 ** 31 - 1,
+                                  max_string_int=2 ** 63 - 1):
+    ...
+```
+
+`safe_range` is the inclusive boundary at which integers stay JSON numbers
+(default `2**53 - 1`, exported as `MAX_SAFE_INTEGER`); `max_string_int` is
+the inclusive maximum absolute value accepted when restoring a string
+(default `2**63 - 1`, exported as `MAX_COMPAT_INTEGER`). The mode is off by
+default and `int_compat_mode()` restores the previous configuration on exit,
+so it can be nested safely.
+
+Custom field/global encoders and decoders keep their existing precedence:
+when an `encoder`/`decoder` is configured for a field or for `int`, it runs
+instead of the compatibility conversion.
+
 ### Handle missing or optional field values when decoding?
 
 By default, any fields in your dataclass that use `default` or 
