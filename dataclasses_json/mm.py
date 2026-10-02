@@ -18,6 +18,8 @@ from marshmallow.exceptions import ValidationError  # type: ignore
 
 from dataclasses_json.core import (_is_supported_generic, _decode_dataclass,
                                    _ExtendedEncoder, _user_overrides_or_exts)
+from dataclasses_json.iso8601 import (Iso8601Error, decode_iso8601,
+                                      encode_iso8601)
 from dataclasses_json.utils import (_is_collection, _is_optional,
                                     _issubclass_safe, _timestamp_to_dt_aware,
                                     _is_new_type, _get_type_origin,
@@ -58,6 +60,40 @@ class _IsoField(fields.Field):
     def _deserialize(self, value, attr, data, **kwargs):
         if value is not None:
             return datetime.fromisoformat(value)
+        else:
+            if not self.required:
+                return None
+            else:
+                raise ValidationError(self.default_error_messages["required"])
+
+
+class _Iso8601Field(fields.Field):
+    """Marshmallow field implementing the explicit ISO 8601 datetime
+    spec (see ``dataclasses_json.iso8601``). Never consults the local
+    machine timezone; unrepresentable values raise field errors."""
+
+    def __init__(self, spec, *args, **kwargs):
+        self.spec = spec
+        super().__init__(*args, **kwargs)
+
+    def _serialize(self, value, attr, obj, **kwargs):
+        if value is not None:
+            try:
+                return encode_iso8601(value, self.spec)
+            except Iso8601Error as exc:
+                raise ValidationError(str(exc)) from exc
+        else:
+            if not self.required:
+                return None
+            else:
+                raise ValidationError(self.default_error_messages["required"])
+
+    def _deserialize(self, value, attr, data, **kwargs):
+        if value is not None:
+            try:
+                return decode_iso8601(value, self.spec)
+            except Iso8601Error as exc:
+                raise ValidationError(str(exc)) from exc
         else:
             if not self.required:
                 return None
@@ -235,7 +271,7 @@ else:
     SchemaType = Schema
 
 
-def build_type(type_, options, mixin, field, cls):
+def build_type(type_, options, mixin, field, cls, datetime_field=None):
     def inner(type_, options):
         while True:
             if not _is_new_type(type_):
@@ -274,6 +310,8 @@ def build_type(type_, options, mixin, field, cls):
             else:
                 return fields.Tuple(args, **options)
         if origin in TYPES:
+            if origin is datetime and datetime_field is not None:
+                return datetime_field(**options)
             return TYPES[origin](*args, **options)
 
         if _issubclass_safe(origin, Enum):
@@ -326,7 +364,15 @@ def schema(cls, mixin, infer_missing):
             if metadata.letter_case is not None:
                 options['data_key'] = metadata.letter_case(field.name)
 
-            t = build_type(type_, options, mixin, field, cls)
+            datetime_field = None
+            if metadata.datetime_format is not None:
+                spec = metadata.datetime_format
+
+                def datetime_field(_spec=spec, **kwargs):
+                    return _Iso8601Field(_spec, **kwargs)
+
+            t = build_type(type_, options, mixin, field, cls,
+                           datetime_field=datetime_field)
             if field.metadata.get('dataclasses_json', {}).get('decoder'):
                 # If the field defines a custom decoder, it should completely replace the Marshmallow field's conversion
                 # logic.

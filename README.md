@@ -331,6 +331,67 @@ Personally I recommend you leverage dataclass defaults rather than using
 JSON decoding from the field's default value, this will allow you to do so.
 
 
+### Encode or decode datetimes as ISO 8601?
+
+By default (for backwards compatibility) `datetime` fields are encoded as
+POSIX timestamps and decoded in the **host machine's local timezone**.
+For cross-language interfaces this is usually undesirable, so you can opt
+into an explicit ISO 8601 codec that never consults the machine timezone:
+
+```python
+from dataclasses_json import dataclass_json, Iso8601DateTime, NaivePolicy
+
+@dataclass_json(datetime_format='iso8601')  # shorthand for Iso8601DateTime()
+@dataclass
+class Event:
+    at: datetime
+
+Event(datetime(2018, 11, 17, 16, 55, 28, 456753, tzinfo=timezone.utc)).to_json()
+# '{"at": "2018-11-17T16:55:28.456753Z"}'
+```
+
+The option can also be set (and overridden) per field; a field-level spec
+wins over the class-level one:
+
+```python
+@dataclass_json(datetime_format=Iso8601DateTime(fraction_digits=0))
+@dataclass
+class Metrics:
+    bucket: datetime
+    sampled: datetime = field(metadata=config(
+        datetime_format=Iso8601DateTime(fraction_digits=3)))
+```
+
+`Iso8601DateTime` parameters:
+
+- `fraction_digits`: fractional-second digits emitted on encode. `6`
+  (default) keeps microseconds, `0` omits the fraction, `None` strips
+  trailing zeros.
+- `naive`: policy for values without UTC offset information.
+  `NaivePolicy.REJECT` (default) raises an error rather than silently
+  borrowing the machine's local timezone; `NaivePolicy.ASSUME_UTC`
+  interprets naive values as UTC.
+- `use_z`: emit `Z` instead of `+00:00` for UTC (default `True`).
+
+Decoding always accepts `Z`/`z` and numeric `±HH:MM[:SS]` offsets, and the
+decoded `datetime` always carries explicit `tzinfo` -- the represented
+instant is preserved exactly, identically on any host timezone (including
+DST-repeated local times, which stay disambiguated by their offset).
+
+Unrepresentable input is rejected with a field error
+(`Iso8601Error` from `from_json`/`from_dict`, `ValidationError` from
+`schema().load(s)`) instead of being silently corrected: leap seconds
+(`23:59:60Z`), out-of-range dates (e.g. month 13, year 0000), invalid
+offsets and sub-microsecond precision all raise.
+
+The spec applies uniformly to `to_json`/`from_json`, nested containers
+(`List[datetime]`, `Dict[str, datetime]`, `Optional[datetime]`, ...) and
+`schema().dump`/`load`. Precedence is: an explicitly configured
+`encoder`/`decoder`/`mm_field` always wins, then the field-level
+`datetime_format`, then the class-level one, then the legacy timestamp
+default.
+
+
 ### Handle unknown / extraneous fields in JSON?
 
 By default, it is up to the implementation what happens when a `json_dataclass` receives input parameters that are not defined.

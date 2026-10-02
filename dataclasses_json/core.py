@@ -20,6 +20,7 @@ from uuid import UUID
 from typing_inspect import is_union_type  # type: ignore
 
 from dataclasses_json import cfg
+from dataclasses_json.iso8601 import decode_iso8601, encode_iso8601
 from dataclasses_json.utils import (_get_type_cons, _get_type_origin,
                                     _handle_undefined_parameters_safe,
                                     _is_collection, _is_mapping, _is_new_type,
@@ -32,7 +33,8 @@ from dataclasses_json.utils import (_get_type_cons, _get_type_origin,
 
 Json = Union[dict, list, str, int, float, bool, None]
 
-confs = ['encoder', 'decoder', 'mm_field', 'letter_case', 'exclude']
+confs = ['encoder', 'decoder', 'mm_field', 'letter_case', 'exclude',
+         'datetime_format']
 FieldOverride = namedtuple('FieldOverride', confs)  # type: ignore
 collections_abc_type_to_implementation_type = MappingProxyType({
     ABCCollection: tuple,
@@ -85,6 +87,7 @@ def _user_overrides_or_exts(cls):
         cls_config = {}
 
     overrides = {}
+    type_hints = None
     for field in fields(cls):
         field_config = {}
         # first apply global overrides or extensions
@@ -99,8 +102,66 @@ def _user_overrides_or_exts(cls):
         field_config.update(cls_config)
         # last apply field-level overrides or extensions
         field_config.update(field.metadata.get('dataclasses_json', {}))
+        dt_spec = field_config.get('datetime_format')
+        if dt_spec is not None and ('encoder' not in field_config
+                                    or 'decoder' not in field_config):
+            if type_hints is None:
+                try:
+                    type_hints = get_type_hints(cls)
+                except Exception:
+                    type_hints = {}
+            _apply_datetime_format(field_config, dt_spec,
+                                   type_hints.get(field.name, field.type))
         overrides[field.name] = FieldOverride(*map(field_config.get, confs))
     return overrides
+
+
+def _type_mentions_datetime(type_):
+    """Whether decoding/encoding values of this type can encounter a
+    datetime leaf. Nested dataclasses manage their own configuration, so
+    they are not descended into."""
+    if _issubclass_safe(type_, datetime):
+        return True
+    if _is_new_type(type_):
+        return _type_mentions_datetime(type_.__supertype__)
+    if is_dataclass(type_):
+        return False
+    if _is_supported_generic(type_) or _is_optional(type_) \
+            or is_union_type(type_):
+        return any(_type_mentions_datetime(arg)
+                   for arg in _get_type_args(type_)
+                   if arg is not type(None))
+    return False
+
+
+def _encode_iso8601_value(value, spec):
+    """Recursively encode every datetime leaf in a (possibly nested)
+    value as an ISO 8601 string. Non-datetime values pass through."""
+    if isinstance(value, datetime):
+        return encode_iso8601(value, spec)
+    if isinstance(value, dict):
+        return {_encode_iso8601_value(k, spec): _encode_iso8601_value(v, spec)
+                for k, v in value.items()}
+    if isinstance(value, list):
+        return [_encode_iso8601_value(v, spec) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_encode_iso8601_value(v, spec) for v in value)
+    return value
+
+
+def _apply_datetime_format(field_config, spec, field_type):
+    """Install ISO 8601 encoder/decoder for datetime-bearing fields when
+    a ``datetime_format`` spec is configured. Explicitly configured
+    encoders/decoders always take precedence."""
+    if not _type_mentions_datetime(field_type):
+        return
+    if 'encoder' not in field_config:
+        field_config['encoder'] = \
+            lambda value: _encode_iso8601_value(value, spec)
+    if 'decoder' not in field_config:
+        field_config['decoder'] = lambda value: _decode_type(
+            field_type, value, infer_missing=False,
+            dt_decoder=lambda v: decode_iso8601(v, spec))
 
 
 def _encode_json_type(value, default=_ExtendedEncoder().default):
@@ -240,23 +301,25 @@ def _decode_dataclass(cls, kvs, infer_missing):
     return cls(**init_kwargs)
 
 
-def _decode_type(type_, value, infer_missing):
+def _decode_type(type_, value, infer_missing, dt_decoder=None):
     if _has_decoder_in_global_config(type_):
         return _get_decoder_in_global_config(type_)(value)
     if _is_supported_generic(type_):
-        return _decode_generic(type_, value, infer_missing)
+        return _decode_generic(type_, value, infer_missing, dt_decoder)
     if is_dataclass(type_) or is_dataclass(value):
         return _decode_dataclass(type_, value, infer_missing)
-    return _support_extended_types(type_, value)
+    return _support_extended_types(type_, value, dt_decoder)
 
 
-def _support_extended_types(field_type, field_value):
+def _support_extended_types(field_type, field_value, dt_decoder=None):
     if _issubclass_safe(field_type, datetime):
         # FIXME this is a hack to deal with mm already decoding
         # the issue is we want to leverage mm fields' missing argument
         # but need this for the object creation hook
         if isinstance(field_value, datetime):
             res = field_value
+        elif dt_decoder is not None:
+            res = dt_decoder(field_value)
         else:
             tz = datetime.now(timezone.utc).astimezone().tzinfo
             res = datetime.fromtimestamp(field_value, tz=tz)
@@ -287,7 +350,7 @@ def _is_supported_generic(type_):
         type_) or is_union_type(type_) or is_enum or is_generic_dataclass
 
 
-def _decode_generic(type_, value, infer_missing):
+def _decode_generic(type_, value, infer_missing, dt_decoder=None):
     if value is None:
         res = value
     elif _issubclass_safe(type_, Enum):
@@ -300,19 +363,25 @@ def _decode_generic(type_, value, infer_missing):
             k_type, v_type = _get_type_args(type_, (Any, Any))
             # a mapping type has `.keys()` and `.values()`
             # (see collections.abc)
-            ks = _decode_dict_keys(k_type, value.keys(), infer_missing)
-            vs = _decode_items(v_type, value.values(), infer_missing)
+            ks = _decode_dict_keys(k_type, value.keys(), infer_missing,
+                                   dt_decoder)
+            vs = _decode_items(v_type, value.values(), infer_missing,
+                               dt_decoder)
             xs = zip(ks, vs)
         elif _is_tuple(type_):
             types = _get_type_args(type_)
             if Ellipsis in types:
-                xs = _decode_items(types[0], value, infer_missing)
+                xs = _decode_items(types[0], value, infer_missing, dt_decoder)
             else:
-                xs = _decode_items(_get_type_args(type_) or _NO_ARGS, value, infer_missing)
+                xs = _decode_items(_get_type_args(type_) or _NO_ARGS, value,
+                                   infer_missing, dt_decoder)
         elif _is_counter(type_):
-            xs = dict(zip(_decode_items(_get_type_arg_param(type_, 0), value.keys(), infer_missing), value.values()))
+            xs = dict(zip(_decode_items(_get_type_arg_param(type_, 0),
+                                        value.keys(), infer_missing,
+                                        dt_decoder), value.values()))
         else:
-            xs = _decode_items(_get_type_arg_param(type_, 0), value, infer_missing)
+            xs = _decode_items(_get_type_arg_param(type_, 0), value,
+                               infer_missing, dt_decoder)
 
         collection_type = _resolve_collection_type_to_decode_to(type_)
         res = collection_type(xs)
@@ -326,7 +395,7 @@ def _decode_generic(type_, value, infer_missing):
             res = value
         elif _is_optional(type_) and len(_args) == 2:  # Optional
             type_arg = _get_type_arg_param(type_, 0)
-            res = _decode_type(type_arg, value, infer_missing)
+            res = _decode_type(type_arg, value, infer_missing, dt_decoder)
         else:  # Union (already decoded or try to decode a dataclass)
             type_options = _get_type_args(type_)
             res = value  # assume already decoded
@@ -346,7 +415,7 @@ def _decode_generic(type_, value, infer_missing):
     return res
 
 
-def _decode_dict_keys(key_type, xs, infer_missing):
+def _decode_dict_keys(key_type, xs, infer_missing, dt_decoder=None):
     """
     Because JSON object keys must be strs, we need the extra step of decoding
     them back into the user's chosen python type
@@ -370,10 +439,11 @@ def _decode_dict_keys(key_type, xs, infer_missing):
         decode_function = tuple
         key_type = key_type
 
-    return map(decode_function, _decode_items(key_type, xs, infer_missing))
+    return map(decode_function,
+               _decode_items(key_type, xs, infer_missing, dt_decoder))
 
 
-def _decode_items(type_args, xs, infer_missing):
+def _decode_items(type_args, xs, infer_missing, dt_decoder=None):
     """
     This is a tricky situation where we need to check both the annotated
     type info (which is usually a type from `typing`) and check the
@@ -401,13 +471,15 @@ def _decode_items(type_args, xs, infer_missing):
 
     if _isinstance_safe(type_args, Collection) and not _issubclass_safe(type_args, Enum):
         if len(type_args) == len(xs):
-            return list(_decode_type(type_arg, x, infer_missing) for type_arg, x in zip(type_args, xs))
+            return list(_decode_type(type_arg, x, infer_missing, dt_decoder)
+                        for type_arg, x in zip(type_args, xs))
         else:
             raise TypeError(f"Number of types specified in the collection type {str(type_args)} "
                             f"does not match number of elements in the collection. In case you are working with tuples"
                             f"take a look at this document "
                             f"docs.python.org/3/library/typing.html#annotating-tuples.")
-    return list(_decode_type(type_args, x, infer_missing) for x in xs)
+    return list(_decode_type(type_args, x, infer_missing, dt_decoder)
+                for x in xs)
 
 
 def _resolve_collection_type_to_decode_to(type_):
