@@ -18,6 +18,7 @@ from typing import (Any, Collection, Mapping, Union, get_type_hints,
 from uuid import UUID
 
 from typing_inspect import is_union_type  # type: ignore
+from marshmallow.exceptions import ValidationError  # type: ignore
 
 from dataclasses_json import cfg
 from dataclasses_json.utils import (_get_type_cons, _get_type_origin,
@@ -32,7 +33,8 @@ from dataclasses_json.utils import (_get_type_cons, _get_type_origin,
 
 Json = Union[dict, list, str, int, float, bool, None]
 
-confs = ['encoder', 'decoder', 'mm_field', 'letter_case', 'exclude']
+confs = ['encoder', 'decoder', 'mm_field', 'letter_case', 'exclude',
+         'read_only', 'write_only']
 FieldOverride = namedtuple('FieldOverride', confs)  # type: ignore
 collections_abc_type_to_implementation_type = MappingProxyType({
     ABCCollection: tuple,
@@ -99,8 +101,145 @@ def _user_overrides_or_exts(cls):
         field_config.update(cls_config)
         # last apply field-level overrides or extensions
         field_config.update(field.metadata.get('dataclasses_json', {}))
+        if field_config.get('read_only') and field_config.get('write_only'):
+            raise ValueError(
+                f"Field {cls.__name__}.{field.name} cannot be both "
+                f"read-only and write-only"
+            )
         overrides[field.name] = FieldOverride(*map(field_config.get, confs))
     return overrides
+
+
+def _data_key(field_name, override):
+    letter_case = override.letter_case
+    return letter_case(field_name) if letter_case is not None else field_name
+
+
+def _directional_data_keys(cls, overrides, read_only=False, write_only=False):
+    keys = set()
+    for field in fields(cls):
+        override = overrides[field.name]
+        if (read_only and override.read_only) or \
+                (write_only and override.write_only):
+            keys.add(field.name)
+            keys.add(_data_key(field.name, override))
+    return keys
+
+
+def _raise_read_only_fields(cls, kvs, overrides):
+    if not isinstance(kvs, ABCMapping):
+        return
+
+    read_only_keys = _directional_data_keys(cls, overrides, read_only=True)
+    provided_read_only = sorted(key for key in kvs if key in read_only_keys)
+    catch_all_name = _get_catch_all_field_name(cls)
+    if catch_all_name is not None and \
+            overrides[catch_all_name].read_only:
+        known_keys = {
+            _data_key(field.name, overrides[field.name])
+            for field in fields(cls)
+        }
+        known_keys.update(field.name for field in fields(cls))
+        provided_read_only.extend(
+            sorted(key for key in kvs if key not in known_keys)
+        )
+    if provided_read_only:
+        errors = {
+            key: ["Read-only field cannot be provided when loading."]
+            for key in sorted(set(provided_read_only))
+        }
+        raise ValidationError(errors)
+
+
+def _get_catch_all_field_name(cls):
+    from dataclasses_json.undefined import _CatchAllUndefinedParameters
+
+    try:
+        return _CatchAllUndefinedParameters._get_catch_all_field(cls).name
+    except Exception:
+        return None
+
+
+def _remove_write_only_dataclass_fields(cls, value):
+    if is_dataclass(value) or not isinstance(value, ABCMapping):
+        return value
+
+    overrides = _user_overrides_or_exts(cls)
+    write_only_keys = _directional_data_keys(cls, overrides, write_only=True)
+    catch_all_name = _get_catch_all_field_name(cls)
+    types = get_type_hints(cls)
+    result = {}
+
+    for key, item in value.items():
+        if key in write_only_keys:
+            continue
+        if key == catch_all_name and isinstance(item, ABCMapping):
+            item = {
+                catch_all_key: catch_all_value
+                for catch_all_key, catch_all_value in item.items()
+                if catch_all_key not in write_only_keys
+            }
+        elif key in types:
+            item = _remove_write_only_generic(types[key], item)
+        result[key] = item
+
+    return result
+
+
+def _remove_write_only_generic(type_, value):
+    if value is None:
+        return value
+
+    while _is_new_type(type_):
+        type_ = type_.__supertype__
+
+    if is_dataclass(type_):
+        return _remove_write_only_dataclass_fields(type_, value)
+
+    if isinstance(value, (str, bytes)):
+        return value
+
+    args = _get_type_args(type_)
+    if isinstance(value, ABCMapping) and _is_mapping(type_) and \
+            not _is_counter(type_):
+        key_type, value_type = _get_type_args(type_, (Any, Any))
+        return {
+            _remove_write_only_generic(key_type, key):
+                _remove_write_only_generic(value_type, item)
+            for key, item in value.items()
+        }
+
+    if isinstance(value, (tuple, list, set, frozenset)):
+        if args is _NO_ARGS:
+            return value
+        constructor = type(value) if isinstance(value, (list, tuple, set,
+                                                        frozenset)) else list
+        if len(args) == 1 or (_is_tuple(type_) and len(args) == 2 and
+                              args[1] == Ellipsis):
+            return constructor(
+                _remove_write_only_generic(args[0], item) for item in value
+            )
+        if _is_tuple(type_):
+            return constructor(
+                _remove_write_only_generic(item_type, item)
+                for item_type, item in zip(args, value)
+            )
+        return value
+
+    origin = _get_type_origin(type_)
+    if is_dataclass(origin):
+        return _remove_write_only_dataclass_fields(origin, value)
+
+    if args is not _NO_ARGS:
+        if _is_optional(type_) and len(args) == 2:
+            return _remove_write_only_generic(args[0], value)
+        if is_union_type(type_):
+            for option in args:
+                if option is not type(None) and \
+                        isinstance(value, _get_type_origin(option)):
+                    return _remove_write_only_generic(option, value)
+
+    return value
 
 
 def _encode_json_type(value, default=_ExtendedEncoder().default):
@@ -157,6 +296,7 @@ def _decode_dataclass(cls, kvs, infer_missing):
     if _isinstance_safe(kvs, cls):
         return kvs
     overrides = _user_overrides_or_exts(cls)
+    _raise_read_only_fields(cls, kvs, overrides)
     kvs = {} if kvs is None and infer_missing else kvs
     field_names = [field.name for field in fields(cls)]
     decode_names = _decode_letter_case_overrides(field_names, overrides)
@@ -430,7 +570,12 @@ def _asdict(obj, encode_json=False):
     if is_dataclass(obj):
         result = []
         overrides = _user_overrides_or_exts(obj)
+        catch_all_name = _get_catch_all_field_name(type(obj))
+        catch_all_write_only = catch_all_name is not None and \
+            overrides[catch_all_name].write_only
         for field in fields(obj):
+            if overrides[field.name].write_only:
+                continue
             if overrides[field.name].encoder:
                 value = getattr(obj, field.name)
             else:
@@ -440,10 +585,12 @@ def _asdict(obj, encode_json=False):
                 )
             result.append((field.name, value))
 
-        result = _handle_undefined_parameters_safe(cls=obj, kvs=dict(result),
-                                                   usage="to")
-        return _encode_overrides(dict(result), _user_overrides_or_exts(obj),
-                                 encode_json=encode_json)
+        result = dict(result)
+        if not catch_all_write_only:
+            result = _handle_undefined_parameters_safe(cls=obj, kvs=result,
+                                                       usage="to")
+            result = _remove_write_only_generic(type(obj), result)
+        return _encode_overrides(result, overrides, encode_json=encode_json)
     elif isinstance(obj, Mapping):
         return dict((_asdict(k, encode_json=encode_json),
                      _asdict(v, encode_json=encode_json)) for k, v in

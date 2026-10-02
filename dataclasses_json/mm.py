@@ -13,11 +13,14 @@ from enum import Enum
 
 from typing_inspect import is_union_type  # type: ignore
 
-from marshmallow import fields, Schema, post_load  # type: ignore
+from marshmallow import fields, Schema, post_load, pre_load  # type: ignore
 from marshmallow.exceptions import ValidationError  # type: ignore
 
 from dataclasses_json.core import (_is_supported_generic, _decode_dataclass,
-                                   _ExtendedEncoder, _user_overrides_or_exts)
+                                   _ExtendedEncoder, _user_overrides_or_exts,
+                                   _raise_read_only_fields,
+                                   _remove_write_only_generic,
+                                   _get_catch_all_field_name)
 from dataclasses_json.utils import (_is_collection, _is_optional,
                                     _issubclass_safe, _timestamp_to_dt_aware,
                                     _is_new_type, _get_type_origin,
@@ -301,7 +304,12 @@ def schema(cls, mixin, infer_missing):
     for field in dc_fields(cls):
         metadata = overrides[field.name]
         if metadata.mm_field is not None:
-            schema[field.name] = metadata.mm_field
+            mm_field = deepcopy(metadata.mm_field)
+            if metadata.read_only:
+                mm_field.dump_only = True
+            if metadata.write_only:
+                mm_field.load_only = True
+            schema[field.name] = mm_field
         else:
             type_ = field.type
             options: typing.Dict[str, typing.Any] = {}
@@ -325,6 +333,10 @@ def schema(cls, mixin, infer_missing):
 
             if metadata.letter_case is not None:
                 options['data_key'] = metadata.letter_case(field.name)
+            if metadata.read_only:
+                options['dump_only'] = True
+            if metadata.write_only:
+                options['load_only'] = True
 
             t = build_type(type_, options, mixin, field, cls)
             if field.metadata.get('dataclasses_json', {}).get('decoder'):
@@ -362,6 +374,11 @@ def build_schema(cls: typing.Type[A],
     def make_instance(self, kvs, **kwargs):
         return _decode_dataclass(cls, kvs, partial)
 
+    @pre_load
+    def reject_read_only_fields(self, data, **kwargs):
+        _raise_read_only_fields(cls, data, _user_overrides_or_exts(cls))
+        return data
+
     def dumps(self, *args, **kwargs):
         if 'cls' not in kwargs:
             kwargs['cls'] = _ExtendedEncoder
@@ -371,6 +388,10 @@ def build_schema(cls: typing.Type[A],
     def dump(self, obj, *, many=None):
         many = self.many if many is None else bool(many)
         dumped = Schema.dump(self, obj, many=many)
+        schema_overrides = _user_overrides_or_exts(cls)
+        catch_all_name = _get_catch_all_field_name(cls)
+        catch_all_write_only = catch_all_name is not None and \
+            schema_overrides[catch_all_name].write_only
         # TODO This is hacky, but the other option I can think of is to generate a different schema
         #  depending on dump and load, which is even more hacky
 
@@ -378,12 +399,21 @@ def build_schema(cls: typing.Type[A],
         # so we just update the dumped dict
         if many:
             for i, _obj in enumerate(obj):
-                dumped[i].update(
+                extra = {} if catch_all_write_only else \
                     _handle_undefined_parameters_safe(cls=_obj, kvs={},
-                                                      usage="dump"))
+                                                      usage="dump")
+                if isinstance(extra, dict):
+                    extra = _remove_write_only_generic(type(_obj), extra)
+                    dumped[i].update(extra)
         else:
-            dumped.update(_handle_undefined_parameters_safe(cls=obj, kvs={},
-                                                            usage="dump"))
+            extra = {} if catch_all_write_only else \
+                _handle_undefined_parameters_safe(cls=obj, kvs={},
+                                                  usage="dump")
+            if isinstance(extra, dict):
+                extra = _remove_write_only_generic(type(obj), extra)
+                dumped.update(extra)
+        target_type = typing.List[type(obj[0])] if many else type(obj)
+        dumped = _remove_write_only_generic(target_type, dumped)
         return dumped
 
     schema_ = schema(cls, mixin, infer_missing)
@@ -392,6 +422,7 @@ def build_schema(cls: typing.Type[A],
         (Schema,),
         {'Meta': Meta,
          f'make_{cls.__name__.lower()}': make_instance,
+         'reject_read_only_fields': reject_read_only_fields,
          'dumps': dumps,
          'dump': dump,
          **schema_})
