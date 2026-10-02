@@ -17,7 +17,9 @@ from marshmallow import fields, Schema, post_load  # type: ignore
 from marshmallow.exceptions import ValidationError  # type: ignore
 
 from dataclasses_json.core import (_is_supported_generic, _decode_dataclass,
-                                   _ExtendedEncoder, _user_overrides_or_exts)
+                                   _ExtendedEncoder, _user_overrides_or_exts,
+                                   _encode_int_compat, _decode_int_compat,
+                                   _int_compat_enabled)
 from dataclasses_json.utils import (_is_collection, _is_optional,
                                     _issubclass_safe, _timestamp_to_dt_aware,
                                     _is_new_type, _get_type_origin,
@@ -128,6 +130,38 @@ class _TupleVarLen(fields.List):
     def _deserialize(self, value, attr, data, **kwargs):
         optional_list = super()._deserialize(value, attr, data, **kwargs)
         return None if optional_list is None else tuple(optional_list)
+
+
+class _CompatInteger(fields.Integer):
+    """Integer field that mirrors the safe-integer mode of the direct API.
+
+    Out-of-range plain integers are dumped as decimal strings and only plain
+    decimal strings are loaded back into integers at integer positions.
+    """
+
+    def _serialize(self, value, attr, obj, **kwargs):
+        if value is None:
+            return None
+        # bool is not an int for this purpose; json.dumps emits it as-is
+        if isinstance(value, bool):
+            return value
+        return _encode_int_compat(int(value))
+
+    def _deserialize(self, value, attr, data, **kwargs):
+        try:
+            return _decode_int_compat(value)
+        except (TypeError, ValueError) as error:
+            raise ValidationError(str(error)) from error
+
+
+class _CompatRaw(fields.Raw):
+    """Raw field that applies the safe-integer mode to nested runtime data
+    so that ``Any`` fields behave the same as through the direct API."""
+
+    def _serialize(self, value, attr, obj, **kwargs):
+        if value is None:
+            return None
+        return _encode_int_compat(value)
 
 
 TYPES = {
@@ -273,6 +307,10 @@ def build_type(type_, options, mixin, field, cls):
                 return _TupleVarLen(args[0], **options)
             else:
                 return fields.Tuple(args, **options)
+        if _int_compat_enabled() and origin is int:
+            return _CompatInteger(**options)
+        if _int_compat_enabled() and origin is typing.Any:
+            return _CompatRaw(**options)
         if origin in TYPES:
             return TYPES[origin](*args, **options)
 

@@ -1,5 +1,6 @@
 import copy
 import json
+import re
 import sys
 import warnings
 from collections import defaultdict, namedtuple
@@ -31,6 +32,60 @@ from dataclasses_json.utils import (_get_type_cons, _get_type_origin,
                                     _is_generic_dataclass)
 
 Json = Union[dict, list, str, int, float, bool, None]
+
+# A plain base-10 integer literal, optionally signed. Decimals, exponent
+# notation, whitespace and non-ASCII digits are deliberately rejected.
+_INT_LITERAL_RE = re.compile(r'^-?\d+$')
+
+
+def _int_compat_enabled():
+    return cfg.global_config.int_mode is cfg.IntMode.SAFE
+
+
+def _encode_int_compat(value):
+    """Recursively emit out-of-range plain ``int`` values as decimal strings.
+
+    ``bool`` and ``int`` subclasses (e.g. ``enum.IntEnum``) are not plain
+    integers and are returned untouched. Containers are walked so the mode
+    covers nested lists, tuples, sets and mappings, including ``Any`` values.
+    """
+    if type(value) is int:
+        limit = cfg.global_config.int_safe_limit
+        if abs(value) > limit:
+            return str(value)
+        return value
+    if isinstance(value, Mapping):
+        return {_encode_int_compat(k): _encode_int_compat(v)
+                for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        encoded = [_encode_int_compat(v) for v in value]
+        return type(value)(encoded) if type(value) in (tuple, set, frozenset) \
+            else encoded
+    return value
+
+
+def _decode_int_compat(value):
+    """Restore an integer at a position explicitly annotated as ``int``.
+
+    Only decimal strings without a fraction or exponent are accepted.
+    """
+    if isinstance(value, bool):
+        return value
+    if type(value) is int:
+        return value
+    if isinstance(value, str):
+        if _INT_LITERAL_RE.match(value) is None:
+            raise ValueError(
+                f"invalid integer string {value!r}: only plain decimal "
+                f"integers are accepted in safe integer mode")
+        parsed = int(value)
+        max_abs = cfg.global_config.int_max_abs
+        if max_abs is not None and abs(parsed) > max_abs:
+            raise ValueError(
+                f"integer string {value!r} exceeds the configured maximum "
+                f"magnitude of {max_abs}")
+        return parsed
+    return int(value)
 
 confs = ['encoder', 'decoder', 'mm_field', 'letter_case', 'exclude']
 FieldOverride = namedtuple('FieldOverride', confs)  # type: ignore
@@ -243,6 +298,8 @@ def _decode_dataclass(cls, kvs, infer_missing):
 def _decode_type(type_, value, infer_missing):
     if _has_decoder_in_global_config(type_):
         return _get_decoder_in_global_config(type_)(value)
+    while _is_new_type(type_):
+        type_ = type_.__supertype__
     if _is_supported_generic(type_):
         return _decode_generic(type_, value, infer_missing)
     if is_dataclass(type_) or is_dataclass(value):
@@ -251,6 +308,8 @@ def _decode_type(type_, value, infer_missing):
 
 
 def _support_extended_types(field_type, field_value):
+    if field_type is int and _int_compat_enabled():
+        return _decode_int_compat(field_value)
     if _issubclass_safe(field_type, datetime):
         # FIXME this is a hack to deal with mm already decoding
         # the issue is we want to leverage mm fields' missing argument
@@ -456,7 +515,10 @@ def _asdict(obj, encode_json=False):
     elif _has_encoder_in_global_config(type(obj)):
         return _get_encoder_in_global_config(type(obj))(obj)
     else:
-        return copy.deepcopy(obj)
+        value = copy.deepcopy(obj)
+        if _int_compat_enabled():
+            value = _encode_int_compat(value)
+        return value
 
 
 def _has_decoder_in_global_config(type_):

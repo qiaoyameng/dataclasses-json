@@ -10,6 +10,37 @@ from dataclasses_json.undefined import Undefined, UndefinedParameterError
 
 T = TypeVar("T")
 
+#: The largest integer that can be represented exactly as a JavaScript
+#: number (IEEE 754 double precision), i.e. ``Number.MAX_SAFE_INTEGER``.
+MAX_SAFE_INTEGER = 2 ** 53 - 1
+
+#: Largest magnitude accepted when restoring an integer from a string by
+#: default. Signed 64 bit identifiers stay within this range.
+MAX_SIGNED_64BIT = 2 ** 63 - 1
+
+_UNSET = object()
+
+
+class IntMode(Enum):
+    """Controls how plain :class:`int` values are encoded to and decoded
+    from JSON.
+
+    ``LEGACY`` keeps the historical behavior: integers are always emitted as
+    JSON numbers and decoding never accepts strings at integer positions.
+
+    ``SAFE`` enables the JavaScript integer compatibility mode: integers
+    outside the configured safe range are emitted as decimal strings and,
+    when decoding, only positions explicitly annotated as ``int`` restore
+    such strings back to integers.
+    """
+    LEGACY = "legacy"
+    SAFE = "safe"
+
+
+def _check_positive_int(value, name):
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{name} must be a non-negative int, got {value!r}")
+
 
 class Exclude:
     """
@@ -30,7 +61,35 @@ class _GlobalConfig:
             Union[type, Optional[type]],
             MarshmallowField
         ] = {}
+        self.int_mode: IntMode = IntMode.LEGACY
+        self.int_safe_limit: int = MAX_SAFE_INTEGER
+        self.int_max_abs: Optional[int] = MAX_SIGNED_64BIT
         # self._json_module = json
+
+    def set_int_compatibility(self,
+                              *,
+                              enabled: bool = True,
+                              safe_limit: Optional[int] = None,
+                              max_abs: Optional[int] = _UNSET) -> None:
+        """Configure the integer compatibility mode.
+
+        :param enabled: turn the safe-integer mode on (``IntMode.SAFE``) or
+            off (``IntMode.LEGACY``).
+        :param safe_limit: integers with ``abs(value)`` strictly greater than
+            this limit are emitted as decimal strings. Defaults to
+            ``2 ** 53 - 1``.
+        :param max_abs: maximum magnitude accepted when restoring an integer
+            from a string. Defaults to ``2 ** 63 - 1`` (signed 64 bit ids).
+            Pass ``None`` to remove the upper bound.
+        """
+        self.int_mode = IntMode.SAFE if enabled else IntMode.LEGACY
+        if safe_limit is not None:
+            _check_positive_int(safe_limit, "safe_limit")
+            self.int_safe_limit = safe_limit
+        if max_abs is not _UNSET:
+            if max_abs is not None:
+                _check_positive_int(max_abs, "max_abs")
+            self.int_max_abs = max_abs
 
     # TODO: #180
     # @property
