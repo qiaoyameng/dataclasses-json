@@ -289,6 +289,48 @@ Person.from_json('{"overriddenGivenName": "Alice"}')  # Person('Alice')
 Person('Alice').to_json()  # {"overriddenGivenName": "Alice"}
 ```
 
+### Mark fields as read-only or write-only?
+
+When a single dataclass models both a request and a response (e.g. a
+client-supplied password alongside a server-generated audit field), you can
+mark fields as `write_only` or `read_only` with `config`.
+
+A `write_only` field (like a password) is accepted when decoding, but is
+skipped when encoding, so it never appears in `to_dict` / `to_json` /
+`schema().dump()` output.
+
+A `read_only` field (like a server-generated audit id) is included when
+encoding, but providing it when decoding raises a `ValidationError`. If it is
+missing, the usual `default` / `default_factory` rules apply. This works
+consistently across `from_dict` / `from_json` and `schema().load()`, and the
+check is applied after field-name aliasing, so aliases, inheritance, nested
+collections and `CatchAll` cannot be used to sneak a read-only value in.
+
+The two markers are mutually exclusive: setting both raises a `ValueError`.
+
+```python
+from dataclasses import dataclass, field
+
+from dataclasses_json import config, dataclass_json
+
+@dataclass_json
+@dataclass
+class Account:
+    username: str
+    password: str = field(
+        metadata=config(field_name="passwordHash", write_only=True))
+    audit_id: str = field(
+        default_factory=lambda: "server-generated",
+        metadata=config(read_only=True))
+
+Account.from_json('{"username": "alice", "passwordHash": "secret"}')
+# Account(username='alice', password='secret', audit_id='server-generated')
+Account.from_json('{"username": "alice", "passwordHash": "secret", "audit_id": "forged"}')
+# ValidationError: read-only fields may not be provided when decoding
+Account("alice", "secret").to_json()
+# '{"username": "alice", "audit_id": "server-generated"}'
+```
+
 ### Handle missing or optional field values when decoding?
 
 By default, any fields in your dataclass that use `default` or 

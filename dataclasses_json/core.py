@@ -19,6 +19,8 @@ from uuid import UUID
 
 from typing_inspect import is_union_type  # type: ignore
 
+from marshmallow.exceptions import ValidationError  # type: ignore
+
 from dataclasses_json import cfg
 from dataclasses_json.utils import (_get_type_cons, _get_type_origin,
                                     _handle_undefined_parameters_safe,
@@ -32,7 +34,8 @@ from dataclasses_json.utils import (_get_type_cons, _get_type_origin,
 
 Json = Union[dict, list, str, int, float, bool, None]
 
-confs = ['encoder', 'decoder', 'mm_field', 'letter_case', 'exclude']
+confs = ['encoder', 'decoder', 'mm_field', 'letter_case', 'exclude',
+         'read_only', 'write_only']
 FieldOverride = namedtuple('FieldOverride', confs)  # type: ignore
 collections_abc_type_to_implementation_type = MappingProxyType({
     ABCCollection: tuple,
@@ -118,6 +121,9 @@ def _encode_overrides(kvs, overrides, encode_json=False):
     override_kvs = {}
     for k, v in kvs.items():
         if k in overrides:
+            # Write-only fields are never included in the encoded output
+            if overrides[k].write_only:
+                continue
             exclude = overrides[k].exclude
             # If the exclude predicate returns true, the key should be
             #  excluded from encoding, so skip the rest of the loop
@@ -161,6 +167,13 @@ def _decode_dataclass(cls, kvs, infer_missing):
     field_names = [field.name for field in fields(cls)]
     decode_names = _decode_letter_case_overrides(field_names, overrides)
     kvs = {decode_names.get(k, k): v for k, v in kvs.items()}
+    read_only_errors = {
+        field.name: ["Field is read-only."]
+        for field in fields(cls)
+        if overrides[field.name].read_only and field.name in kvs
+    }
+    if read_only_errors:
+        raise ValidationError(read_only_errors)
     missing_fields = {field for field in fields(cls) if field.name not in kvs}
 
     for field in missing_fields:

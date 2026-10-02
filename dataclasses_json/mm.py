@@ -326,6 +326,12 @@ def schema(cls, mixin, infer_missing):
             if metadata.letter_case is not None:
                 options['data_key'] = metadata.letter_case(field.name)
 
+            if metadata.read_only:
+                options['dump_only'] = True
+
+            if metadata.write_only:
+                options['load_only'] = True
+
             t = build_type(type_, options, mixin, field, cls)
             if field.metadata.get('dataclasses_json', {}).get('decoder'):
                 # If the field defines a custom decoder, it should completely replace the Marshmallow field's conversion

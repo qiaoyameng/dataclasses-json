@@ -64,11 +64,17 @@ def config(metadata: Optional[dict] = None, *,
            undefined: Optional[Union[str, Undefined]] = None,
            field_name: Optional[str] = None,
            exclude: Optional[Callable[[T], bool]] = None,
+           read_only: bool = False,
+           write_only: bool = False,
            ) -> Dict[str, dict]:
     if metadata is None:
         metadata = {}
 
     lib_metadata = metadata.setdefault('dataclasses_json', {})
+
+    if read_only and write_only:
+        raise ValueError(
+            "A field cannot be both read_only and write_only")
 
     if encoder is not None:
         lib_metadata['encoder'] = encoder
@@ -106,5 +112,11 @@ def config(metadata: Optional[dict] = None, *,
 
     if exclude is not None:
         lib_metadata['exclude'] = exclude
+
+    if read_only:
+        lib_metadata['read_only'] = read_only
+
+    if write_only:
+        lib_metadata['write_only'] = write_only
 
     return metadata
