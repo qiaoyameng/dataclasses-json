@@ -309,7 +309,15 @@ def schema(cls, mixin, infer_missing):
             if field.default is not MISSING:
                 options[missing_key] = field.default
             elif field.default_factory is not MISSING:
-                options[missing_key] = field.default_factory()
+                # Marshmallow invokes a callable load_default for each
+                # missing value during load, so the factory runs per
+                # loaded object rather than at schema construction.
+                options[missing_key] = field.default_factory
+                # The factory is not evaluated at schema construction, so a
+                # None-producing factory can no longer be detected here. Keep
+                # the historical leniency: explicit null must be accepted.
+                if not _is_optional(type_):
+                    options['allow_none'] = True
             else:
                 options['required'] = True
 
